@@ -124,6 +124,10 @@ class LLMProcessor:
         """Get list of available models based on provider"""
         if self.provider == "openai":
             return [
+                "gpt-5",
+                "gpt-5-mini",
+                "gpt-5-nano",
+                "gpt-5-pro",
                 "gpt-4o",
                 "gpt-4o-mini", 
                 "gpt-4.1-nano",
@@ -184,14 +188,27 @@ Clean summary:"""
             if not self.is_openai_available():
                 return "Error: OpenAI not configured properly"
             
-            response = self.openai_client.chat.completions.create(
-                model=self.model_name,
-                messages=[
+            # GPT-5 models use max_completion_tokens instead of max_tokens
+            # GPT-5 models only support temperature=1 (default)
+            is_gpt5 = self.model_name.startswith('gpt-5')
+            
+            # Build request parameters
+            request_params = {
+                "model": self.model_name,
+                "messages": [
                     {"role": "user", "content": prompt}
-                ],
-                max_tokens=2000,
-                temperature=0.3
-            )
+                ]
+            }
+            
+            # Use appropriate parameters based on model
+            if is_gpt5:
+                request_params["max_completion_tokens"] = 2000
+                request_params["temperature"] = 1  # GPT-5 only supports default temperature
+            else:
+                request_params["max_tokens"] = 2000
+                request_params["temperature"] = 0.3  # Custom temperature for older models
+            
+            response = self.openai_client.chat.completions.create(**request_params)
             
             return response.choices[0].message.content.strip()
             
@@ -489,16 +506,20 @@ def main():
                         selected_model = st.selectbox(
                             "Select Model:",
                             available_models,
-                            index=2,  # Default to gpt-4.1-nano
+                            index=2,  # Default to gpt-5-nano (most cost-effective GPT-5)
                             help="Choose the OpenAI model to use"
                         )
                         st.session_state.llm_processor.model_name = selected_model
                         
                         # Show estimated costs
                         st.info("💡 **Cost Estimates (per 1K tokens):**\n"
+                               "- GPT-5: $0.00125 input / $0.01 output\n"
+                               "- GPT-5 mini: $0.00025 input / $0.002 output\n"
+                               "- GPT-5 nano: $0.00005 input / $0.0004 output\n"
+                               "- GPT-5 pro: $0.015 input / $0.12 output\n"
                                "- GPT-4o: ~$0.015\n"
                                "- GPT-4o-mini: ~$0.0002\n" 
-                               "- GPT-4.1-nano: ~$0.00015 (Default)\n"
+                               "- GPT-4.1-nano: ~$0.00015\n"
                                "- GPT-3.5-turbo: ~$0.001")
                 else:
                     st.warning("Please enter your OpenAI API key")

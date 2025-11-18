@@ -84,12 +84,25 @@ Clean summary:"""
             if not self.openai_client:
                 return "Error: OpenAI not configured properly"
             
-            response = self.openai_client.chat.completions.create(
-                model=self.model_name,
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=2000,
-                temperature=0.3
-            )
+            # GPT-5 models use max_completion_tokens instead of max_tokens
+            # GPT-5 models only support temperature=1 (default)
+            is_gpt5 = self.model_name.startswith('gpt-5')
+            
+            # Build request parameters
+            request_params = {
+                "model": self.model_name,
+                "messages": [{"role": "user", "content": prompt}]
+            }
+            
+            # Use appropriate parameters based on model
+            if is_gpt5:
+                request_params["max_completion_tokens"] = 2000
+                request_params["temperature"] = 1  # GPT-5 only supports default temperature
+            else:
+                request_params["max_tokens"] = 2000
+                request_params["temperature"] = 0.3  # Custom temperature for older models
+            
+            response = self.openai_client.chat.completions.create(**request_params)
             
             return response.choices[0].message.content.strip()
             
