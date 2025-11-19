@@ -96,7 +96,7 @@ Clean summary:"""
             
             # Use appropriate parameters based on model
             if is_gpt5:
-                request_params["max_completion_tokens"] = 2000
+                request_params["max_completion_tokens"] = 8000  # Higher limit for GPT-5 models
                 request_params["temperature"] = 1  # GPT-5 only supports default temperature
             else:
                 request_params["max_tokens"] = 2000
