@@ -26,6 +26,60 @@ def generate_filename(base_name: str, extension: str) -> str:
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     return f"{base_name}_{timestamp}.{extension}"
 
+def get_checkpoint_dir():
+    """Get or create checkpoint directory"""
+    checkpoint_dir = "checkpoints"
+    if not os.path.exists(checkpoint_dir):
+        os.makedirs(checkpoint_dir)
+    return checkpoint_dir
+
+def get_checkpoint_file(file_hash: str, column: str) -> str:
+    """Get checkpoint file path based on file hash and column"""
+    checkpoint_dir = get_checkpoint_dir()
+    return os.path.join(checkpoint_dir, f"checkpoint_{file_hash}_{column}.json")
+
+def save_checkpoint(file_hash: str, column: str, processed_data: dict):
+    """Save processing checkpoint"""
+    checkpoint_file = get_checkpoint_file(file_hash, column)
+    try:
+        with open(checkpoint_file, 'w', encoding='utf-8') as f:
+            json.dump(processed_data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        st.warning(f"⚠️ Could not save checkpoint: {str(e)}")
+
+def load_checkpoint(file_hash: str, column: str) -> Optional[dict]:
+    """Load processing checkpoint if exists"""
+    checkpoint_file = get_checkpoint_file(file_hash, column)
+    if os.path.exists(checkpoint_file):
+        try:
+            with open(checkpoint_file, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except Exception as e:
+            st.warning(f"⚠️ Could not load checkpoint: {str(e)}")
+    return None
+
+def clear_checkpoint(file_hash: str, column: str):
+    """Clear checkpoint file"""
+    checkpoint_file = get_checkpoint_file(file_hash, column)
+    if os.path.exists(checkpoint_file):
+        try:
+            os.remove(checkpoint_file)
+        except Exception as e:
+            st.warning(f"⚠️ Could not clear checkpoint: {str(e)}")
+
+def get_file_hash(uploaded_file) -> str:
+    """Generate a hash for the uploaded file"""
+    import hashlib
+    uploaded_file.seek(0)
+    file_content = uploaded_file.read()
+    uploaded_file.seek(0)
+    return hashlib.md5(file_content).hexdigest()[:16]
+
+def get_text_hash(text: str) -> str:
+    """Generate a hash for pasted text"""
+    import hashlib
+    return hashlib.md5(text.encode('utf-8')).hexdigest()[:16]
+
 def anonymize_data(text: str, enable_anonymization: bool = False) -> tuple[str, dict]:
     """
     Anonymize sensitive data in text before sending to LLM
@@ -619,8 +673,197 @@ def main():
                     if create_new_column:
                         new_column_name = st.text_input("New column name:", value="agent_notes_processed", key="file_column_name")
                 
-                # Process button
-                if st.button("🚀 Start Processing", type="primary", disabled=not provider_ready, key="file_process_button"):
+                # Checkpoint and resume functionality
+                file_hash = get_file_hash(uploaded_file)
+                checkpoint_data = load_checkpoint(file_hash, selected_column)
+                
+                if checkpoint_data:
+                    st.subheader("💾 Checkpoint Found")
+                    checkpoint_info = checkpoint_data.get('info', {})
+                    processed_count = len(checkpoint_data.get('processed_texts', []))
+                    total_rows = checkpoint_data.get('total_rows', 0)
+                    processed_texts = checkpoint_data.get('processed_texts', [])
+                    
+                    col_resume1, col_resume2 = st.columns([3, 1])
+                    with col_resume1:
+                        st.info(f"📊 **Resume Available**: {processed_count} of {total_rows} rows already processed. You can resume from where you left off.")
+                        
+                        # Download partial results
+                        if processed_count > 0:
+                            partial_df = df.copy()
+                            checkpoint_column = checkpoint_data.get('new_column_name', 'agent_notes_processed')
+                            partial_df[checkpoint_column] = processed_texts + [''] * (len(df) - len(processed_texts))
+                            
+                            col_dl1, col_dl2 = st.columns(2)
+                            with col_dl1:
+                                csv_buffer = io.StringIO()
+                                partial_df.to_csv(csv_buffer, index=False)
+                                csv_data = csv_buffer.getvalue()
+                                st.download_button(
+                                    label="📥 Download Partial Results (CSV)",
+                                    data=csv_data,
+                                    file_name=generate_filename("partial_processed_data", "csv"),
+                                    mime="text/csv",
+                                    key="partial_csv_dl"
+                                )
+                            with col_dl2:
+                                excel_buffer = io.BytesIO()
+                                with pd.ExcelWriter(excel_buffer, engine='openpyxl') as writer:
+                                    partial_df.to_excel(writer, index=False, sheet_name='Partial Processed Data')
+                                excel_data = excel_buffer.getvalue()
+                                st.download_button(
+                                    label="📥 Download Partial Results (Excel)",
+                                    data=excel_data,
+                                    file_name=generate_filename("partial_processed_data", "xlsx"),
+                                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                    key="partial_excel_dl"
+                                )
+                    with col_resume2:
+                        if st.button("🗑️ Clear Checkpoint", key="file_clear_checkpoint", type="secondary"):
+                            clear_checkpoint(file_hash, selected_column)
+                            st.rerun()
+                    
+                    # Resume button
+                    st.divider()
+                    if st.button("▶️ Resume Processing", type="primary", disabled=not provider_ready, key="file_resume_button", use_container_width=True):
+                        st.session_state.resume_from_checkpoint = True
+                        st.rerun()
+                
+                # Process button (only show if no checkpoint or user wants to start fresh)
+                if not checkpoint_data:
+                    if st.button("🚀 Start Processing", type="primary", disabled=not provider_ready, key="file_process_button"):
+                        if not provider_ready:
+                            if provider == "ollama":
+                                st.error("Please start Ollama first!")
+                            else:
+                                st.error("Please configure OpenAI API key first!")
+                            return
+                        
+                        # Create progress tracking
+                        progress_bar = st.progress(0)
+                        status_text = st.empty()
+                        
+                        # Create containers for real-time display
+                        st.subheader("🔄 Live Processing Results")
+                        results_container = st.container()
+                        
+                        # Process data
+                        processed_df = df.copy()
+                        
+                        # Start fresh
+                        processed_texts = []
+                        start_index = 0
+                        
+                        rows_to_process = min(max_rows, len(df))
+                        
+                        with results_container:
+                            for i in range(start_index, rows_to_process):
+                                status_text.text(f"Processing row {i+1} of {rows_to_process}...")
+                                progress_bar.progress((i) / rows_to_process)
+                                
+                                original_text = str(df.iloc[i][selected_column])
+                                
+                                # Create expandable section for each row
+                                with st.expander(f"Row {i+1} - {'Processing...' if pd.notna(original_text) and original_text.strip() != '' and original_text != 'nan' else 'Skipped (empty)'}", expanded=i < 3):
+                                    col1, col2 = st.columns([1, 1])
+                                    
+                                    with col1:
+                                        st.markdown("**📝 Original Text:**")
+                                        if pd.isna(original_text) or original_text.strip() == '' or original_text == 'nan':
+                                            st.info("No content to process")
+                                            processed_text = "No content to process"
+                                        else:
+                                            st.text_area("Original", original_text, height=200, disabled=True, key=f"orig_{i}")
+                                    
+                                    with col2:
+                                        st.markdown("**🤖 LLM Output:**")
+                                        if pd.isna(original_text) or original_text.strip() == '' or original_text == 'nan':
+                                            st.info("Skipped - No content")
+                                            processed_text = "No content to process"
+                                        else:
+                                            # Show processing indicator
+                                            processing_placeholder = st.empty()
+                                            processing_placeholder.info("🔄 Processing with LLM...")
+                                            
+                                            # Process the text with anonymization if enabled
+                                            enable_anon = st.session_state.get('enable_anonymization', False)
+                                            processed_text = st.session_state.llm_processor.process_text(original_text, custom_prompt, enable_anon)
+                                            
+                                            # Replace processing indicator with result
+                                            processing_placeholder.empty()
+                                            st.text_area("Processed", processed_text, height=200, disabled=True, key=f"proc_{i}")
+                                    
+                                    processed_texts.append(processed_text)
+                                
+                                # Save checkpoint after each row
+                                checkpoint_data = {
+                                    'processed_texts': processed_texts,
+                                    'total_rows': rows_to_process,
+                                    'column': selected_column,
+                                    'new_column_name': new_column_name if create_new_column else selected_column,
+                                    'timestamp': datetime.now().isoformat(),
+                                    'info': {
+                                        'processed_count': len(processed_texts),
+                                        'total_rows': rows_to_process
+                                    }
+                                }
+                                save_checkpoint(file_hash, selected_column, checkpoint_data)
+                                
+                                # Update progress
+                                progress_bar.progress((i + 1) / rows_to_process)
+                        
+                        # Add processed text to dataframe
+                        if create_new_column:
+                            processed_df[new_column_name] = processed_texts + [''] * (len(df) - len(processed_texts))
+                        else:
+                            processed_df.loc[:len(processed_texts)-1, selected_column] = processed_texts
+                        
+                        status_text.text("✅ Processing complete!")
+                        st.success(f"Successfully processed {rows_to_process} rows!")
+                        
+                        # Clear checkpoint when processing is complete
+                        clear_checkpoint(file_hash, selected_column)
+                        
+                        # Show final results summary
+                        st.subheader("📊 Final Results Summary")
+                        st.dataframe(processed_df, use_container_width=True, height=300)
+                        
+                        # Download options
+                        st.subheader("💾 Download Results")
+                        
+                        col1, col2 = st.columns(2)
+                        
+                        with col1:
+                            # CSV download
+                            csv_buffer = io.StringIO()
+                            processed_df.to_csv(csv_buffer, index=False)
+                            csv_data = csv_buffer.getvalue()
+                            
+                            st.download_button(
+                                label="📥 Download as CSV",
+                                data=csv_data,
+                                file_name=generate_filename("processed_data", "csv"),
+                                mime="text/csv"
+                            )
+                        
+                        with col2:
+                            # Excel download
+                            excel_buffer = io.BytesIO()
+                            with pd.ExcelWriter(excel_buffer, engine='openpyxl') as writer:
+                                processed_df.to_excel(writer, index=False, sheet_name='Processed Data')
+                            excel_data = excel_buffer.getvalue()
+                            
+                            st.download_button(
+                                label="📥 Download as Excel",
+                                data=excel_data,
+                                file_name=generate_filename("processed_data", "xlsx"),
+                                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                            )
+                
+                # Resume processing (when checkpoint exists and resume button clicked)
+                if checkpoint_data and st.session_state.get('resume_from_checkpoint', False):
+                    st.session_state.resume_from_checkpoint = False  # Reset flag
+                    
                     if not provider_ready:
                         if provider == "ollama":
                             st.error("Please start Ollama first!")
@@ -633,17 +876,29 @@ def main():
                     status_text = st.empty()
                     
                     # Create containers for real-time display
-                    st.subheader("🔄 Live Processing Results")
+                    st.subheader("🔄 Live Processing Results (Resuming)")
                     results_container = st.container()
                     
                     # Process data
                     processed_df = df.copy()
-                    processed_texts = []
+                    
+                    # Load checkpoint if exists
+                    checkpoint_data_resume = load_checkpoint(file_hash, selected_column)
+                    
+                    if checkpoint_data_resume and checkpoint_data_resume.get('total_rows') == max_rows:
+                        # Resume from checkpoint
+                        processed_texts = checkpoint_data_resume.get('processed_texts', [])
+                        start_index = len(processed_texts)
+                        st.info(f"🔄 Resuming from row {start_index + 1}...")
+                    else:
+                        # Start fresh
+                        processed_texts = []
+                        start_index = 0
                     
                     rows_to_process = min(max_rows, len(df))
                     
                     with results_container:
-                        for i in range(rows_to_process):
+                        for i in range(start_index, rows_to_process):
                             status_text.text(f"Processing row {i+1} of {rows_to_process}...")
                             progress_bar.progress((i) / rows_to_process)
                             
@@ -659,7 +914,7 @@ def main():
                                         st.info("No content to process")
                                         processed_text = "No content to process"
                                     else:
-                                        st.text_area("Original", original_text, height=200, disabled=True, key=f"orig_{i}")
+                                        st.text_area("Original", original_text, height=200, disabled=True, key=f"orig_resume_{i}")
                                 
                                 with col2:
                                     st.markdown("**🤖 LLM Output:**")
@@ -677,9 +932,23 @@ def main():
                                         
                                         # Replace processing indicator with result
                                         processing_placeholder.empty()
-                                        st.text_area("Processed", processed_text, height=200, disabled=True, key=f"proc_{i}")
+                                        st.text_area("Processed", processed_text, height=200, disabled=True, key=f"proc_resume_{i}")
                                 
                                 processed_texts.append(processed_text)
+                            
+                            # Save checkpoint after each row
+                            checkpoint_data_save = {
+                                'processed_texts': processed_texts,
+                                'total_rows': rows_to_process,
+                                'column': selected_column,
+                                'new_column_name': new_column_name if create_new_column else selected_column,
+                                'timestamp': datetime.now().isoformat(),
+                                'info': {
+                                    'processed_count': len(processed_texts),
+                                    'total_rows': rows_to_process
+                                }
+                            }
+                            save_checkpoint(file_hash, selected_column, checkpoint_data_save)
                             
                             # Update progress
                             progress_bar.progress((i + 1) / rows_to_process)
@@ -692,6 +961,57 @@ def main():
                     
                     status_text.text("✅ Processing complete!")
                     st.success(f"Successfully processed {rows_to_process} rows!")
+                    
+                    # Clear checkpoint when processing is complete
+                    clear_checkpoint(file_hash, selected_column)
+                    
+                    # Show final results summary
+                    st.subheader("📊 Final Results Summary")
+                    st.dataframe(processed_df, use_container_width=True, height=300)
+                    
+                    # Download options
+                    st.subheader("💾 Download Results")
+                    
+                    col1, col2 = st.columns(2)
+                    
+                    with col1:
+                        # CSV download
+                        csv_buffer = io.StringIO()
+                        processed_df.to_csv(csv_buffer, index=False)
+                        csv_data = csv_buffer.getvalue()
+                        
+                        st.download_button(
+                            label="📥 Download as CSV",
+                            data=csv_data,
+                            file_name=generate_filename("processed_data", "csv"),
+                            mime="text/csv"
+                        )
+                    
+                    with col2:
+                        # Excel download
+                        excel_buffer = io.BytesIO()
+                        with pd.ExcelWriter(excel_buffer, engine='openpyxl') as writer:
+                            processed_df.to_excel(writer, index=False, sheet_name='Processed Data')
+                        excel_data = excel_buffer.getvalue()
+                        
+                        st.download_button(
+                            label="📥 Download as Excel",
+                            data=excel_data,
+                            file_name=generate_filename("processed_data", "xlsx"),
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                        )
+                    
+                    # Add processed text to dataframe
+                    if create_new_column:
+                        processed_df[new_column_name] = processed_texts + [''] * (len(df) - len(processed_texts))
+                    else:
+                        processed_df.loc[:len(processed_texts)-1, selected_column] = processed_texts
+                    
+                    status_text.text("✅ Processing complete!")
+                    st.success(f"Successfully processed {rows_to_process} rows!")
+                    
+                    # Clear checkpoint when processing is complete
+                    clear_checkpoint(file_hash, selected_column)
                     
                     # Show final results summary
                     st.subheader("📊 Final Results Summary")
@@ -859,6 +1179,7 @@ def main():
             df = parse_pasted_data(pasted_text)
             if df is not None:
                 st.session_state.pasted_df = df
+                st.session_state.pasted_text = pasted_text  # Store for checkpoint hashing
                 st.success(f"Data parsed successfully! Shape: {df.shape}")
             else:
                 st.error("Failed to parse the pasted data. Please check the format.")
@@ -866,6 +1187,7 @@ def main():
         # Use the DataFrame from session state if available
         if 'pasted_df' in st.session_state:
             df = st.session_state.pasted_df
+            pasted_text_for_hash = st.session_state.get('pasted_text', '')
             
             st.success(f"✅ Data loaded! Shape: {df.shape}")
             
@@ -924,6 +1246,56 @@ def main():
                 if create_new_column:
                     new_column_name = st.text_input("New column name:", value="agent_notes_processed", key="paste_column_name")
             
+            # Checkpoint and resume functionality
+            text_hash = get_text_hash(pasted_text_for_hash) if pasted_text_for_hash else ""
+            checkpoint_data = load_checkpoint(text_hash, selected_column) if text_hash else None
+            
+            if checkpoint_data:
+                st.subheader("💾 Checkpoint Found")
+                checkpoint_info = checkpoint_data.get('info', {})
+                processed_count = len(checkpoint_data.get('processed_texts', []))
+                total_rows = checkpoint_data.get('total_rows', 0)
+                processed_texts_checkpoint = checkpoint_data.get('processed_texts', [])
+                
+                col_resume1, col_resume2 = st.columns([3, 1])
+                with col_resume1:
+                    st.info(f"📊 **Resume Available**: {processed_count} of {total_rows} rows already processed. You can resume from where you left off.")
+                    
+                    # Download partial results
+                    if processed_count > 0:
+                        partial_df = df.copy()
+                        checkpoint_column = checkpoint_data.get('new_column_name', 'agent_notes_processed')
+                        partial_df[checkpoint_column] = processed_texts_checkpoint + [''] * (len(df) - len(processed_texts_checkpoint))
+                        
+                        col_dl1, col_dl2 = st.columns(2)
+                        with col_dl1:
+                            csv_buffer = io.StringIO()
+                            partial_df.to_csv(csv_buffer, index=False)
+                            csv_data = csv_buffer.getvalue()
+                            st.download_button(
+                                label="📥 Download Partial Results (CSV)",
+                                data=csv_data,
+                                file_name=generate_filename("partial_processed_data", "csv"),
+                                mime="text/csv",
+                                key="partial_csv_dl_paste"
+                            )
+                        with col_dl2:
+                            excel_buffer = io.BytesIO()
+                            with pd.ExcelWriter(excel_buffer, engine='openpyxl') as writer:
+                                partial_df.to_excel(writer, index=False, sheet_name='Partial Processed Data')
+                            excel_data = excel_buffer.getvalue()
+                            st.download_button(
+                                label="📥 Download Partial Results (Excel)",
+                                data=excel_data,
+                                file_name=generate_filename("partial_processed_data", "xlsx"),
+                                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                key="partial_excel_dl_paste"
+                            )
+                with col_resume2:
+                    if st.button("🗑️ Clear Checkpoint", key="paste_clear_checkpoint", type="secondary"):
+                        clear_checkpoint(text_hash, selected_column)
+                        st.rerun()
+            
             # Process button
             if st.button("🚀 Start Processing", type="primary", disabled=not provider_ready, key="paste_process_button"):
                 if not provider_ready:
@@ -943,12 +1315,28 @@ def main():
                 
                 # Process data
                 processed_df = df.copy()
-                processed_texts = []
+                
+                # Load checkpoint if exists
+                text_hash = get_text_hash(pasted_text_for_hash) if pasted_text_for_hash else ""
+                checkpoint_data = load_checkpoint(text_hash, selected_column) if text_hash else None
+                
+                if checkpoint_data and checkpoint_data.get('total_rows') == max_rows:
+                    # Resume from checkpoint
+                    processed_texts = checkpoint_data.get('processed_texts', [])
+                    start_index = len(processed_texts)
+                    st.info(f"🔄 Resuming from row {start_index + 1}...")
+                else:
+                    # Start fresh
+                    processed_texts = []
+                    start_index = 0
+                    # Clear old checkpoint if exists
+                    if checkpoint_data:
+                        clear_checkpoint(text_hash, selected_column)
                 
                 rows_to_process = min(max_rows, len(df))
                 
                 with results_container:
-                    for i in range(rows_to_process):
+                    for i in range(start_index, rows_to_process):
                         status_text.text(f"Processing row {i+1} of {rows_to_process}...")
                         progress_bar.progress((i) / rows_to_process)
                         
@@ -986,6 +1374,21 @@ def main():
                             
                             processed_texts.append(processed_text)
                         
+                        # Save checkpoint after each row
+                        if text_hash:
+                            checkpoint_data = {
+                                'processed_texts': processed_texts,
+                                'total_rows': rows_to_process,
+                                'column': selected_column,
+                                'new_column_name': new_column_name if create_new_column else selected_column,
+                                'timestamp': datetime.now().isoformat(),
+                                'info': {
+                                    'processed_count': len(processed_texts),
+                                    'total_rows': rows_to_process
+                                }
+                            }
+                            save_checkpoint(text_hash, selected_column, checkpoint_data)
+                        
                         # Update progress
                         progress_bar.progress((i + 1) / rows_to_process)
                 
@@ -997,6 +1400,10 @@ def main():
                 
                 status_text.text("✅ Processing complete!")
                 st.success(f"Successfully processed {rows_to_process} rows!")
+                
+                # Clear checkpoint when processing is complete
+                if text_hash:
+                    clear_checkpoint(text_hash, selected_column)
                 
                 # Show final results summary
                 st.subheader("📊 Final Results Summary")
